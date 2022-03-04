@@ -76,8 +76,8 @@ struct Trajectory
 
 void stab_live(cuda::GpuMat prev, cuda::GpuMat& cur);
 void stab_live_size(cuda::GpuMat prev, cuda::GpuMat& cur, cuda::GpuMat& draw);
+void stab_live_frame(cuda::GpuMat prev, cuda::GpuMat& cur, cuda::GpuMat& draw);
 void stab_live_2(cuda::GpuMat prev, cuda::GpuMat& cur, cuda::GpuMat& draw);
-int stab_live2(cuda::GpuMat prev, cuda::GpuMat cur);
 static void drawArrows(Mat& frame, const vector< Point2f>& prevPts, const vector< Point2f>& nextPts, const vector< uchar>& status, const vector<uchar>& inlier, Scalar line_color);
 
 
@@ -104,8 +104,8 @@ int main(int argc, char ** argv)
         //VideoCapture cap("C:/Users/4Dreplay/Downloads/003060_join3.mp4");
         VideoCapture cap("D:/test/stabil/ncaa1.mp4");
         int fps = (int)cap.get(CAP_PROP_FPS);
-        VideoWriter src_output("ncaa1-normal-thrsh3(src).avi", VideoWriter::fourcc('M', 'J', 'P', 'G'), fps, Size(1920/2, 1080/2));
-        VideoWriter dst_output("ncaa1-normal-thrsh3(dst).avi", VideoWriter::fourcc('M', 'J', 'P', 'G'), fps, Size(1920 , 1080));
+        VideoWriter src_output("ncaa1-every frame update(src).avi", VideoWriter::fourcc('M', 'J', 'P', 'G'), fps, Size(1920/2, 1080/2));
+        VideoWriter dst_output("ncaa1-every frame update(dst).avi", VideoWriter::fourcc('M', 'J', 'P', 'G'), fps, Size(1920 , 1080));
         
        
         if (!cap.isOpened()) {
@@ -131,6 +131,7 @@ int main(int argc, char ** argv)
 
             prev_gpu.upload(img);
             stab_live_size(prev_gpu, cur_gpu, cur_gpu2);
+          //  stab_live_frame(prev_gpu, cur_gpu, cur_gpu2);
            // prev_gpu.download(src);
             if (first)
             {
@@ -152,7 +153,7 @@ int main(int argc, char ** argv)
             if(src.cols==1920/2)
                 src_output.write(src);
             dst_output.write(dst);
-            if (waitKey(100 / fps) == 27) {
+            if (waitKey(1) == 27) {
                 break;
             }
 
@@ -179,166 +180,6 @@ Trajectory K;
 Trajectory z;
 
 
-int stab_live2(cuda::GpuMat prev, cuda::GpuMat cur)
-{
-    cuda::GpuMat prev_gpu, cur_gpu;
-    cuda::GpuMat cur_grey;
-    cuda::GpuMat prev_grey;
-
-
-    cuda::cvtColor(prev, prev_grey, COLOR_BGR2GRAY);
-
-    vector <TransformParam> prev_to_cur_transform;
-    vector <Trajectory> trajectory;
-    vector <Trajectory> smoothed_trajectory;
-    Trajectory X;
-    Trajectory X_;
-    Trajectory P;
-    Trajectory P_;
-    Trajectory K;
-    Trajectory z;
-    double pstd = 4e-3;
-    double cstd = 0.25;
-    Trajectory Q(pstd, pstd, pstd);
-    Trajectory R(cstd, cstd, cstd);
-    vector <TransformParam> new_prev_to_cur_transform;
-    double a = 0, x = 0, y = 0;
-    //Mat T(2, 3, CV_64F);
-
-
-
-    int vert_border = HORIZTAL_BORDER_CROP * prev.rows / prev.cols;
-
-    int k = 1;
-   
-    cuda::GpuMat prev_grey_, cur_grey_;
-
-    cuda::cvtColor(cur, cur_grey, COLOR_BGR2GRAY);
-
-
-    cuda::GpuMat prev_corner, cur_corner;
-    cuda::GpuMat prev_corner2, cur_corner2;
-    //vector <Point2f> prev_corner, cur_corner;
-    //vector <Point2f> prev_corner2, cur_corner2;
-  //  cuda::GpuMat gpuStatus;
-    //vector <uchar> status;
-    cuda::GpuMat status;
-    vector <float> err;
-
-
-    Ptr<cuda::CornersDetector> detector = cuda::createGoodFeaturesToTrackDetector(prev_grey.type(), 200, 0.01, 30);
-    //auto detector = cuda::createGoodFeaturesToTrackDetector(prev_grey.type(), 200, 0.01, 30);
-    detector->detect(prev_grey, prev_corner);
-    // goodFeaturesToTrack(prev_grey, prev_corner, 200, 0.01, 30);
-
-    Ptr<cuda::SparsePyrLKOpticalFlow> pryLK_sparse = cuda::SparsePyrLKOpticalFlow::create(Size(21, 21), 3, 30);
-    pryLK_sparse->calc(prev_grey, cur_grey, prev_corner, cur_corner, status);
-    //calcOpticalFlowPyrLK(prev_grey, cur_grey, prev_corner, cur_corner, status, err);
-
-    //for (size_t i = 0; i < status.size(); i++) {
-    //    if (status[i]) {
-    //        prev_corner2.push_back(prev_corner[i]);
-    //        cur_corner2.push_back(cur_corner[i]);
-    //    }
-    //}
-
-    vector<Point2f> prevPts(prev_corner.cols);
-    prev_corner.download(prevPts);
-
-    vector<Point2f> curPts(cur_corner.cols);
-    cur_corner.download(curPts);
-
-    vector<uchar> stat(status.cols);
-    status.download(stat);
-
-    Mat prev_corner_c, cur_corner_c;
-    prev_corner.download(prev_corner_c);
-    cur_corner.download(cur_corner_c);
-
-    Mat T = estimateAffine2D(prev_corner_c, cur_corner_c);
-
-    if (T.data == NULL) {
-        last_T.copyTo(T);
-    }
-
-  //  T.copyTo(last_T);
-    last_T = T;
-
-
-    double dx = T.at<double>(0, 2);
-    double dy = T.at<double>(1, 2);
-    double da = atan2(T.at<double>(1, 0), T.at<double>(0, 0));
-
-    x += dx;
-    y += dy;
-    a += da;
-
-    z = Trajectory(x, y, a);
-
-    if (k == 1) {
-        X = Trajectory(0, 0, 0);
-        P = Trajectory(1, 1, 1);
-    }
-    else
-    {
-        X_ = X;
-        P_ = P + Q;
-        K = P_ / (P_ + R);
-        X = X_ + K * (z - X_);
-        P = (Trajectory(1, 1, 1) - K) * P_;
-    }
-
-    double diff_x = X.x - x;
-    double diff_y = X.y - y;
-    double diff_a = X.a - a;
-
-    dx = dx + diff_x;
-    dy = dy + diff_y;
-    da = da + diff_a;
-
-    T.at<double>(0, 0) = cos(da);
-    T.at<double>(0, 1) = -sin(da);
-    T.at<double>(1, 0) = sin(da);
-    T.at<double>(1, 1) = cos(da);
-
-    T.at<double>(0, 2) = dx;
-    T.at<double>(1, 2) = dy;
-
-    cuda::GpuMat cur2;
-    //Mat cur2;
-
-    cuda::warpAffine(prev, cur2, T, cur.size());
-    //warpAffine(prev, cur2, T, cur.size());
-
-    cur2 = cur2(Range(vert_border, cur2.rows - vert_border), Range(HORIZTAL_BORDER_CROP, cur2.cols - HORIZTAL_BORDER_CROP));
-
-    cuda::resize(cur2, cur2, cur.size());
-
-
-    cur = cur2;
-
-    Mat grey;
-    prev.download(grey);
-   // drawArrows(grey, prevPts, curPts, stat, Scalar(44, 200, 255));
-    prev.upload(grey);
-    /*   Mat canvas = Mat::zeros(cur.rows, cur.cols * 2 * 10, cur.type());
-
-       prev.copyTo(canvas(Range::all(), Range(0, cur2.cols)));
-       cur2.copyTo(canvas(Range::all(), Range(cur2.cols + 10, cur2.cols * 2 + 10)));
-
-       if (canvas.cols > 1920) {
-           resize(canvas, canvas, Size(1920, 540));
-       }*/
-
-
-    //prev_gpu = prev.clone();
- //   cur_grey.copyTo(prev_grey);
-
-
-
-    return 1;
-}
-
 cuda::GpuMat cur_grey;
 cuda::GpuMat prev_grey;
 Ptr<cuda::CornersDetector> detector;
@@ -355,7 +196,18 @@ vector <TransformParam> new_prev_to_cur_transform;
 Trajectory Q;
 Trajectory R;
 double CROP_PER = 0.01;
+int frame_cnt = 0;
 //cuda::GpuMat last_T;
+cuda::GpuMat preimg;
+cuda::GpuMat prev_corner_gpu, cur_corner_gpu;
+vector<Point2f> prev_corner, cur_corner;
+vector<Point2f> prev_corner2, cur_corner2;
+
+
+cuda::GpuMat gpuErr;
+
+vector <float> err;
+
 
 
 void stab_live(cuda::GpuMat img, cuda::GpuMat& cur2)
@@ -534,6 +386,8 @@ void stab_live_size(cuda::GpuMat img, cuda::GpuMat& cur2, cuda::GpuMat& draw)
 
     else {
         cuda::cvtColor(img, cur_grey, COLOR_BGR2GRAY);
+        cuda::cvtColor(prevImgCuda, prev_grey, COLOR_BGR2GRAY);
+        cuda::resize(prev_grey, prev_grey, Size(img.cols / 2, img.rows / 2));
         cuda::resize(cur_grey, cur_grey, Size(img.cols / 2, img.rows / 2));
 
 
@@ -567,7 +421,7 @@ void stab_live_size(cuda::GpuMat img, cuda::GpuMat& cur2, cuda::GpuMat& draw)
 
 
         for (size_t i = 0; i < prev_corner.size(); i++) {
-            //if (status[i]   && err[i] < 10) {
+            //if (status[i]   && err[i] < 5) {
             if (status[i]) {
                 prev_corner2.push_back(prev_corner[i]);
                 cur_corner2.push_back(cur_corner[i]);
@@ -593,11 +447,12 @@ void stab_live_size(cuda::GpuMat img, cuda::GpuMat& cur2, cuda::GpuMat& draw)
        // Mat inlier;
         vector<uchar> inlier;
         //
-        T = estimateAffine2D(prev_corner2, cur_corner2, inlier, RANSAC, 3);
-       // T = estimateAffinePartial2D(prev_corner2, cur_corner2,inlier,RANSAC,3);
+       // T = estimateAffine2D(prev_corner2, cur_corner2, inlier, RANSAC, 3);
       
+        T = estimateAffinePartial2D(prev_corner2, cur_corner2,inlier,RANSAC,3); //similar to rigidtransform.
+       // T = estimateAffinePartial2D( cur_corner2, prev_corner2, inlier, RANSAC, 3); //similar to rigidtransform.
         
-        T = T*2;
+        T = T*2;    //corner size 1/2
 
 
         if (T.data == NULL) {
@@ -650,6 +505,7 @@ void stab_live_size(cuda::GpuMat img, cuda::GpuMat& cur2, cuda::GpuMat& draw)
 
         T.at<double>(0, 2) = dx;
         T.at<double>(1, 2) = dy;
+
         cout << "dx: " << dx << endl;
         cout << "dy: " << dy << endl;
 
@@ -662,17 +518,18 @@ void stab_live_size(cuda::GpuMat img, cuda::GpuMat& cur2, cuda::GpuMat& draw)
         //if (cur_corner2.size() > 10)
         else
         {
-            cuda::warpAffine(prevImgCuda, cur2, T, img.size());
+         //   cuda::warpAffine(img, cur2, T, img.size());
+           cuda::warpAffine(preimg, cur2, T, img.size());
             //warpAffine(prev, cur2, T, cur.size());
             
-            cur2 = cur2(Range(vert_border, cur2.rows - vert_border), Range(horz_border, cur2.cols - horz_border));
-
-
-            cuda::resize(cur2, cur2, img.size());
         }
+        cur2 = cur2(Range(vert_border, cur2.rows - vert_border), Range(horz_border, cur2.cols - horz_border));
+
+
+        cuda::resize(cur2, cur2, img.size());
     
 
-
+        
         prevImgCuda = img.clone();
         cur_grey.copyTo(prev_grey);
 
@@ -687,9 +544,191 @@ void stab_live_size(cuda::GpuMat img, cuda::GpuMat& cur2, cuda::GpuMat& draw)
         k++;
 
     }
+    preimg = img.clone();
 
 }
 
+
+
+void stab_live_frame(cuda::GpuMat img, cuda::GpuMat& cur2, cuda::GpuMat& draw)
+{
+    Mat T(2, 3, CV_64F);
+
+
+    if (!_first) {
+        // prevImgCuda = img.clone();
+        cuda::resize(img, prevImgCuda, Size(img.cols / 2, img.rows / 2));
+        cuda::cvtColor(prevImgCuda, prev_grey, COLOR_BGR2GRAY);
+
+        _first = true;
+        double pstd = 4e-3;
+        double cstd = 0.25;
+        Q.x = pstd;
+        Q.y = pstd;
+        Q.a = pstd;
+        R.x = cstd;
+        R.y = cstd;
+        R.a = cstd;
+
+   
+        vert_border = prevImgCuda.rows * CROP_PER;
+        horz_border = prevImgCuda.cols * CROP_PER;
+
+        detector = cuda::createGoodFeaturesToTrackDetector(prev_grey.type(), 200, 0.01, 30);
+        pryLK_sparse = cuda::SparsePyrLKOpticalFlow::create(Size(21, 21), 3, 30);
+  
+
+         //return 0;
+    }
+
+    else {
+        if (frame_cnt % 30 == 0)
+        {
+
+            cuda::cvtColor(prevImgCuda, prev_grey, COLOR_BGR2GRAY);
+            cuda::resize(prev_grey, prev_grey, Size(img.cols / 2, img.rows / 2));
+        }
+        cuda::cvtColor(img, cur_grey, COLOR_BGR2GRAY);
+        cuda::resize(cur_grey, cur_grey, Size(img.cols / 2, img.rows / 2));
+
+
+      //  vector<Point2f> prev_corner, cur_corner;
+       // vector<Point2f> prev_corner2, cur_corner2;
+     
+
+
+        cuda::GpuMat gpuStatus;
+        cuda::GpuMat gpuErr;
+        vector <uchar> status;
+        vector <float> err;
+
+        if (frame_cnt % 30 == 0)
+        {
+
+            detector->detect(prev_grey, prev_corner_gpu);
+            prev_corner_gpu.download(prev_corner);
+        }//
+        pryLK_sparse->calc(prev_grey, cur_grey, prev_corner_gpu, cur_corner_gpu, gpuStatus, gpuErr);
+
+
+
+      
+        cur_corner_gpu.download(cur_corner);
+        gpuStatus.download(status);
+        gpuErr.download(err);
+
+        cur_corner2.clear();
+        prev_corner2.clear();
+        for (size_t i = 0; i < prev_corner.size(); i++) {
+            //if (status[i]   && err[i] < 5) {
+            if (status[i]) {
+                //if (frame_cnt % 5 == 0)
+                prev_corner2.push_back(prev_corner[i]);
+                //vector<Point2f> cur_corner2;
+               
+                cur_corner2.push_back(cur_corner[i]);
+            }
+        }
+
+        vector<uchar> inlier;
+
+       // T = estimateAffine2D(prev_corner2, cur_corner2, inlier, RANSAC, 3);
+
+        T = estimateAffinePartial2D(prev_corner2, cur_corner2, inlier, RANSAC, 3); //similar to rigidtransform.
+ 
+        T = T * 2;    //corner size 1/2
+
+
+        if (T.data == NULL) {
+            last_T.copyTo(T);
+        }
+
+        T.copyTo(last_T);
+
+        double dx = T.at<double>(0, 2);
+        double dy = T.at<double>(1, 2);
+        double da = atan2(T.at<double>(1, 0), T.at<double>(0, 0));
+
+        x += dx;
+        y += dy;
+        a += da;
+
+        z = Trajectory(x, y, a);
+
+        if (k == 1) {
+            X = Trajectory(0, 0, 0);
+            P = Trajectory(1, 1, 1);
+        }
+        else
+        {
+            X_ = X;
+            P_ = P + Q;
+            K = P_ / (P_ + R);
+            X = X_ + K * (z - X_);
+            P = (Trajectory(1, 1, 1) - K) * P_;
+        }
+
+        double diff_x = X.x - x;
+        double diff_y = X.y - y;
+        double diff_a = X.a - a;
+
+        dx = dx + diff_x;
+        dy = dy + diff_y;
+        da = da + diff_a;
+
+        /*   T.at<double>(0, 0) = cos(da);
+           T.at<double>(0, 1) = -sin(da);
+           T.at<double>(1, 0) = sin(da);
+           T.at<double>(1, 1) = cos(da);*/
+
+        T.at<double>(0, 0) = 1;
+        T.at<double>(0, 1) = 0;
+        T.at<double>(1, 0) = 0;
+        T.at<double>(1, 1) = 1;
+
+
+        T.at<double>(0, 2) = dx;
+        T.at<double>(1, 2) = dy;
+
+        cout << "dx: " << dx << endl;
+        cout << "dy: " << dy << endl;
+
+        //   cuda::GpuMat cur2;
+           //Mat cur2;
+
+        if (cur_corner2.size() < 10 || dx > 10 || dy > 10)
+            cur2 = img;
+
+        else
+        {
+            //   cuda::warpAffine(img, cur2, T, img.size());
+            cuda::warpAffine(preimg, cur2, T, img.size());
+
+
+        }
+        cur2 = cur2(Range(vert_border, cur2.rows - vert_border), Range(horz_border, cur2.cols - horz_border));
+
+
+        cuda::resize(cur2, cur2, img.size());
+
+
+
+        prevImgCuda = img.clone();
+        cur_grey.copyTo(prev_grey);
+
+        Mat gray;
+        prevImgCuda.download(gray);
+        resize(gray, gray, Size(img.cols / 2, img.rows / 2));
+        drawArrows(gray, prev_corner2, cur_corner2, status, inlier, Scalar(50, 200, 255));
+        draw.upload(gray);
+
+
+        k++;
+
+        frame_cnt++;
+    }
+    preimg = img.clone();
+}
 
 
 void stab_live_2(cuda::GpuMat img, cuda::GpuMat& cur2, cuda::GpuMat& draw)
@@ -864,7 +903,7 @@ void stab_live_2(cuda::GpuMat img, cuda::GpuMat& cur2, cuda::GpuMat& draw)
 
 static void drawArrows(Mat& frame, const vector< Point2f>& prevPts, const vector< Point2f>& nextPts, const vector< uchar>& status, const vector<uchar>& inlier, Scalar line_color)
 {
-    for (size_t i = 0; i < prevPts.size(); ++i)
+    for (size_t i = 0; i < nextPts.size(); ++i)
     {
         if (status[i])
         {
