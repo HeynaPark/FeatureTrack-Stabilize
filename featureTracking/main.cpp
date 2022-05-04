@@ -23,6 +23,11 @@ using namespace std;
 using namespace cv;
 using std::thread;
 
+
+double PROCESS_NOISE = 4e-3;
+double measurementNoise = 0.25;
+
+
 struct Trajectory
 {
 	Trajectory() {}
@@ -57,7 +62,7 @@ struct Trajectory
 
 	double x;
 	double y;
-	double a; // angle
+	double a; 
 };
 
 struct TransformParam
@@ -71,23 +76,23 @@ struct TransformParam
 
 	double dx;
 	double dy;
-	double da; // angle
+	double da; 
 };
 
 
-
-int frame_cnt = 0;
-int cnt = 0;
-int k = 1;
-double maxPixel_x = 0;
-double maxPixel_y = 0;
-double border = 0.01;
+int cnt = 0;	//for debuging
+int k = 1;		//for kalman filter cnt first loop
+int newLeft = 0;
+int newTop = 0;
+int newWidth = 1920;
+int newHeight = 1080;
+double border = 0.005;
 
 Mat last_T;
 
 
-cuda::GpuMat cur_grey;
-cuda::GpuMat prev_grey;
+cuda::GpuMat curGray;
+cuda::GpuMat prevGray;
 Ptr<cuda::CornersDetector> detector;
 Ptr<cuda::SparsePyrLKOpticalFlow> pryLK_sparse;
 Ptr<cuda::FastFeatureDetector> gpuFastDetector;
@@ -122,15 +127,12 @@ Trajectory R;
 
 
 
-
-
-
-void stab_live_keepFirstframe(cuda::GpuMat prev, cuda::GpuMat& cur, cuda::GpuMat& draw);
-void stab_live_size(cuda::GpuMat prev, cuda::GpuMat& cur, cuda::GpuMat& draw);
+void StabilizeFrameNonUpdate(cuda::GpuMat prev, cuda::GpuMat& cur, cuda::GpuMat& draw);
+void StablizeFrame(cuda::GpuMat prev, cuda::GpuMat& cur, cuda::GpuMat& draw);
 void MakeMask(Mat img, cuda::GpuMat& mask);
 void ReclassifyInlier(const vector< Point2f>& prevPts, const vector< Point2f>& nextPts, const vector< uchar>& status, const vector<uchar>& inlier);
 static void drawArrows(Mat& frame, const vector< Point2f>& prevPts, const vector< Point2f>& nextPts, const vector< uchar>& status, Scalar line_color);
-static void drawArrows_new(Mat& frame, const vector< Point2f>& prevPts, const vector< Point2f>& nextPts, const vector< uchar>& status, const vector<uchar>& inlier, Scalar line_color);
+static void DrawArrows_new(Mat& frame, const vector< Point2f>& prevPts, const vector< Point2f>& nextPts, const vector< uchar>& status, const vector<uchar>& inlier, Scalar line_color);
 
 /*
 //image to json
@@ -148,7 +150,7 @@ void writeData(Mat img) {
 */
 
 cuda::GpuMat prevImgCuda;
-cuda::GpuMat prev_gpu, cur_gpu, cur_gpu2;
+
 cuda::GpuMat mask_gpu;
 Mat dst;
 Mat src;
@@ -156,12 +158,11 @@ Mat img;
 Mat manualMask;
 Mat maskImg;
 
-bool first = true;
-bool bDummy = false;
-bool _first = true;
+bool bFirstForSave = true;
+bool bFirst = true;
 bool bMoveStabil = true;
 
-int mask_brush_size = 100;
+int MASK_BRUSH_SIZE = 100;
 
 
 //VideoCapture cap("D:/test/stabil/ncaa1.mp4");
@@ -173,10 +174,10 @@ void dummy() {
 	Mat dummy = imread("dummy.png", IMREAD_GRAYSCALE);
 	cuda::GpuMat dummy_gpu, out;
 	dummy_gpu.upload(dummy);
-	stab_live_size(dummy_gpu, dummy_gpu, out);
-	stab_live_size(dummy_gpu, dummy_gpu, out);
-	bDummy = false;
-	_first = true;
+	StablizeFrame(dummy_gpu, dummy_gpu, out); 
+	StablizeFrame(dummy_gpu, dummy_gpu, out);
+
+	bFirst = true;
 
 }
 
@@ -187,8 +188,8 @@ void onMouseEvent(int event, int x, int y, int flags, void* dstImage) {
 	switch (event) {
 		case EVENT_MOUSEMOVE:
 			if (flags & EVENT_LBUTTONDOWN) {
-				circle(mouseImage, Point(x, y), mask_brush_size, Scalar::all(0), -1);
-				circle(manualMask, Point(x, y), mask_brush_size, Scalar::all(0), -1);
+				circle(mouseImage, Point(x, y), MASK_BRUSH_SIZE, Scalar::all(0), -1);
+				circle(manualMask, Point(x, y), MASK_BRUSH_SIZE, Scalar::all(0), -1);
 			}
 			break;
 	}
@@ -197,8 +198,8 @@ void onMouseEvent(int event, int x, int y, int flags, void* dstImage) {
 }
 
 
-double th = 2;
-int resize_factor = 3;
+double THRESHOLD = 2;
+int RESIZE_FACTOR = 3;
 int minDistance = 40;
 int winSize = 21;
 int maxCorner = 300;
@@ -209,28 +210,25 @@ string Filename = "KBL/kbl124";
 
 int main(int argc, char** argv)
 {
-	
+	cuda::GpuMat prevImgGpu, curImgGpu, outputSrcGpu;
 
-	for (int i = 0; i < 1; i++) {
-		cuda::GpuMat prev_gpu, cur_gpu, cur_gpu2;
+	cap = VideoCapture("D:/test/stabil/" + Filename + ".mp4");
+	int fps = (int)cap.get(CAP_PROP_FPS);
+	int width = cap.get(CAP_PROP_FRAME_WIDTH);
+	int height = cap.get(CAP_PROP_FRAME_HEIGHT);
 
-		cap = VideoCapture("D:/test/stabil/" + Filename + ".mp4");
-		int fps = (int)cap.get(CAP_PROP_FPS);
-		int width = cap.get(CAP_PROP_FRAME_WIDTH);
-		int height = cap.get(CAP_PROP_FRAME_HEIGHT);
+	if (width == 3840)
+		THRESHOLD = 4 / (double)RESIZE_FACTOR;
+	if (width == 1920)
+		THRESHOLD = 2 / (double)RESIZE_FACTOR;
 
-		if (width == 3840)
-			th = 4 / (double)resize_factor;
-		if (width == 1920)
-			th = 2 / (double)resize_factor;
+	VideoWriter dst_output(Filename + "(dst)_size"+to_string(RESIZE_FACTOR)+"_thresh" +to_string(THRESHOLD)+"_dist30.mp4", VideoWriter::fourcc('D', 'I', 'V', 'X'), 30, Size(width, height));
+	VideoWriter src_output(Filename + "(src)_size"+to_string(RESIZE_FACTOR)+"_thresh" +to_string(THRESHOLD)+"_dist30.mp4", VideoWriter::fourcc('D', 'I', 'V', 'X'), 30, Size(width / RESIZE_FACTOR, height / RESIZE_FACTOR));
+	//VideoWriter cmp_output(Filename+"(cmp)_thresh_0.5.mp4", VideoWriter::fourcc('D', 'I', 'V', 'X'), fps, Size(1920,540));
 
-		VideoWriter dst_output(Filename + "(dst)_size"+to_string(resize_factor)+"_thresh" +to_string(th)+"_dist30.mp4", VideoWriter::fourcc('D', 'I', 'V', 'X'), 30, Size(width, height));
-		VideoWriter src_output(Filename + "(src)_size"+to_string(resize_factor)+"_thresh" +to_string(th)+"_dist30.mp4", VideoWriter::fourcc('D', 'I', 'V', 'X'), 30, Size(width / resize_factor, height / resize_factor));
-		//VideoWriter cmp_output(Filename+"(cmp)_thresh_0.5.mp4", VideoWriter::fourcc('D', 'I', 'V', 'X'), fps, Size(1920,540));
-
-		if (!cap.isOpened()) {
-			printf("Can't open the file.");
-			return -1;
+	if (!cap.isOpened()) {
+		printf("Can't open the file.");
+		return -1;
 		}
 
 		cap >> img;
@@ -238,74 +236,66 @@ int main(int argc, char** argv)
 	//	MakeMask(img, mask_gpu);
 
 
-		cout << "image size: " << width << endl;
-		cout << "threshold: " << th << endl;
+	cout << "image size: " << width << endl;
+	cout << "threshold: " << THRESHOLD << endl;
 
 
-		while (1) {
-		
-			cap >> img;
+	while (1) {
+	
+		cap >> img;
 
-			if (img.empty()) {
-				printf("img empty.");
-				break;
-			}
-
-			start = clock();
-			prev_gpu.upload(img);
-
-			stab_live_size(prev_gpu, cur_gpu, cur_gpu2);		// prev 가 매번 업데이트(직전 프레임)
-			//stab_live_keepFirstframe(prev_gpu, cur_gpu, cur_gpu2);	// prev가 첫 프레임으로 고정
-			
-			if (first)
-			{
-				prev_gpu.download(dst);
-				prev_gpu.download(src);
-
-				resize(dst, dst, img.size());
-				first = false;
-			}
-			else
-			{
-				cur_gpu.download(dst);
-				cur_gpu2.download(src);
-			}
-
-			Mat compare;
-		//	hconcat(img, dst, compare);
-		//	resize(compare, compare,Size(1920, 540));
-
-			//imshow("compare", compare);
-			//moveWindow("dst", 0, 0);
-			
-			if (dst.cols == 3840)
-				resize(dst, dst, Size(1920, 1080), INTER_AREA);
-			namedWindow("dst", WINDOW_FULLSCREEN);
-			moveWindow("src", 3840,540);
-			moveWindow("dst", 0, 0);
-			imshow("dst", dst);
-			imshow("src", src);
-			//waitKey(1);
-
-		//	cmp_output.write(compare);
-	/*		if (src.cols == width / resize_factor)
-				src_output.write(src);
-			if(dst.cols == width)
-				dst_output.write(dst);*/
-			if (waitKey(1) == 27) {
-				break;
-			}
-
-
+		if (img.empty()) {
+			printf("img empty.");
+			break;
 		}
 
+		start = clock();
+		prevImgGpu.upload(img);
+
+		StablizeFrame(prevImgGpu, curImgGpu, outputSrcGpu);		// prev 가 매번 업데이트(직전 프레임)
+		//stab_live_keepFirstframe(prev_gpu, cur_gpu, cur_gpu2);	// prev가 첫 프레임으로 고정
 		
-		cap.release();
-		dst_output.release();
-		src_output.release();
+		if (bFirstForSave)
+		{
+			prevImgGpu.download(dst);
+			prevImgGpu.download(src);
+
+			resize(dst, dst, img.size());
+			bFirstForSave = false;
+		}
+		else
+		{
+			curImgGpu.download(dst);
+			outputSrcGpu.download(src);
+		}
+
+
+		
+		if (dst.cols == 3840)
+			resize(dst, dst, Size(1920, 1080), INTER_AREA);
+		namedWindow("dst", WINDOW_FULLSCREEN);
+		moveWindow("src", 3840,540);
+		moveWindow("dst", 0, 0);
+		imshow("dst", dst);
+		imshow("src", src);
+		//waitKey(1);
+
+	/*		if (src.cols == width / resize_factor)
+			src_output.write(src);
+		if(dst.cols == width)
+			dst_output.write(dst);*/
+		if (waitKey(1) == 27) {
+			break;
+		}
 
 
 	}
+
+	
+	cap.release();
+	dst_output.release();
+	src_output.release();
+
 
 
 	waitKey(0);
@@ -318,32 +308,26 @@ int main(int argc, char** argv)
 
 
 
-void stab_live_keepFirstframe(cuda::GpuMat img, cuda::GpuMat& cur2, cuda::GpuMat& draw)
+void StabilizeFrameNonUpdate(cuda::GpuMat img, cuda::GpuMat& cur2, cuda::GpuMat& draw)
 {
 
 	Mat T(2, 3, CV_64F);
 
 
-	if (_first) {
+	if (bFirst) {
+		bFirst = false;
 
+		prev_ = img.clone();
+		cuda::resize(prev_, prevGray, Size(img.cols / RESIZE_FACTOR, img.rows / RESIZE_FACTOR));
+		cuda::cvtColor(prevGray, prevGray, COLOR_BGR2GRAY);
 
-		if (bDummy)
-		{
-			prev_grey = img.clone();
-		}
-		else {
-			prev_ = img.clone();
-			cuda::resize(prev_, prev_grey, Size(img.cols / resize_factor, img.rows / resize_factor));
-			cuda::cvtColor(prev_grey, prev_grey, COLOR_BGR2GRAY);
+		//mask
+		//mask = imread("mask2.png",IMREAD_GRAYSCALE);
+		//mask_gpu.upload(mask);
+		//cuda::resize(mask_gpu, mask_gpu, Size(img.cols / resize_factor, img.rows / resize_factor));
+		
 
-			//mask
-			//mask = imread("mask2.png",IMREAD_GRAYSCALE);
-			//mask_gpu.upload(mask);
-			//cuda::resize(mask_gpu, mask_gpu, Size(img.cols / resize_factor, img.rows / resize_factor));
-		}
-
-
-		_first = false;
+		
 		double pstd = 4e-3;
 		double cstd = 0.25;
 		Q.x = pstd;
@@ -353,10 +337,10 @@ void stab_live_keepFirstframe(cuda::GpuMat img, cuda::GpuMat& cur2, cuda::GpuMat
 		R.y = cstd;
 		R.a = cstd;
 
-		maxPixel_x = img.rows * border;
-		maxPixel_y = img.cols * border;
+		newLeft = img.rows * border;
+		newTop = img.cols * border;
 
-		detector = cuda::createGoodFeaturesToTrackDetector(prev_grey.type(), 1000, 0.01, 20);
+		detector = cuda::createGoodFeaturesToTrackDetector(prevGray.type(), 1000, 0.01, 20);
 		pryLK_sparse = cuda::SparsePyrLKOpticalFlow::create(Size(21, 21), 3, 30);
 		
 	}
@@ -368,14 +352,10 @@ void stab_live_keepFirstframe(cuda::GpuMat img, cuda::GpuMat& cur2, cuda::GpuMat
 
 		start = clock();
 
-		if (bDummy) {
-			cur_grey = img.clone();
-		}
-		else {
-			cuda::resize(img, cur_grey, Size(img.cols / resize_factor, img.rows / resize_factor));
-			cuda::cvtColor(cur_grey, cur_grey, COLOR_BGR2GRAY);
 
-		}
+		cuda::resize(img, curGray, Size(img.cols / RESIZE_FACTOR, img.rows / RESIZE_FACTOR));
+		cuda::cvtColor(curGray, curGray, COLOR_BGR2GRAY);
+
 
 		cuda::GpuMat prev_corner_gpu, cur_corner_gpu;
 		vector<Point2f> prev_corner, cur_corner;
@@ -387,8 +367,8 @@ void stab_live_keepFirstframe(cuda::GpuMat img, cuda::GpuMat& cur2, cuda::GpuMat
 		vector <uchar> status;
 		vector <float> err;
 
-		detector->detect(prev_grey, prev_corner_gpu,mask_gpu);
-		pryLK_sparse->calc(prev_grey, cur_grey, prev_corner_gpu, cur_corner_gpu, gpuStatus, gpuErr);	
+		detector->detect(prevGray, prev_corner_gpu,mask_gpu);
+		pryLK_sparse->calc(prevGray, curGray, prev_corner_gpu, cur_corner_gpu, gpuStatus, gpuErr);	
 
 
 		//예외처리 필요
@@ -406,11 +386,11 @@ void stab_live_keepFirstframe(cuda::GpuMat img, cuda::GpuMat& cur2, cuda::GpuMat
 		}
 
 		vector<uchar> inlier;
-		T = estimateAffinePartial2D(prev_corner2, cur_corner2, inlier, RANSAC, th); //similar to rigidtransform.
+		T = estimateAffinePartial2D(prev_corner2, cur_corner2, inlier, RANSAC, THRESHOLD); //similar to rigidtransform.
 	//	T = getAffineTransform(prev_corner2, cur_corner2);
 
 
-		T = T * resize_factor;  
+		T = T * RESIZE_FACTOR;  
 
 
 		if (T.data == NULL) {
@@ -480,14 +460,14 @@ void stab_live_keepFirstframe(cuda::GpuMat img, cuda::GpuMat& cur2, cuda::GpuMat
 			cuda::warpAffine(img, cur2, T_, img.size());
 		}
 
-		cur2 = cur2(Range(maxPixel_x, cur2.rows - maxPixel_x), Range(maxPixel_y, cur2.cols - maxPixel_y));
+		cur2 = cur2(Range(newLeft, cur2.rows - newLeft), Range(newTop, cur2.cols - newTop));
 		cuda::resize(cur2, cur2, img.size());
 
 		prevImgCuda = img.clone();
 
 		Mat gray;
 		prevImgCuda.download(gray);
-		resize(gray, gray, Size(img.cols / resize_factor, img.rows / resize_factor));
+		resize(gray, gray, Size(img.cols / RESIZE_FACTOR, img.rows / RESIZE_FACTOR));
 	//	drawArrows_new(gray, prev_corner2, cur_corner2, status, inlier, Scalar(50, 200, 255));
 		draw.upload(gray);
 
@@ -501,9 +481,10 @@ void stab_live_keepFirstframe(cuda::GpuMat img, cuda::GpuMat& cur2, cuda::GpuMat
 
 void MakeMask(Mat img, cuda::GpuMat& mask){
 	
-	
+	cuda::GpuMat prevGpu;
+
 	manualMask = Mat(img.rows, img.cols, CV_8UC1, Scalar::all(255));
-	prev_gpu.upload(img);
+	prevGpu.upload(img);
 	namedWindow("Mouse event", WINDOW_NORMAL);
 	//resizeWindow("Mouse event", 600, 100);
 	imshow("mask img", manualMask);
@@ -515,19 +496,17 @@ void MakeMask(Mat img, cuda::GpuMat& mask){
 
 		imwrite(Filename + "_mask.png",manualMask);
 		mask.upload(manualMask);
-		cuda::resize(mask, mask, Size(img.cols / resize_factor, img.rows / resize_factor));
+		cuda::resize(mask, mask, Size(img.cols / RESIZE_FACTOR, img.rows / RESIZE_FACTOR));
 
 	}
 	else if (waitKey(0) == 114 || waitKey(0) == 82) {
 		Mat temp_mask = imread(Filename + "_mask.png",IMREAD_GRAYSCALE);
 		mask.upload(temp_mask);
-		cuda::resize(mask, mask, Size(img.cols / resize_factor, img.rows / resize_factor));
+		cuda::resize(mask, mask, Size(img.cols / RESIZE_FACTOR, img.rows / RESIZE_FACTOR));
 	}
 
 
 	destroyWindow("Mouse event");
-
-
 }
 
 
@@ -535,47 +514,43 @@ Mat newT(2, 3, CV_64F);
 Mat T(2, 3, CV_64F);
 Mat _T(2, 3, CV_64F);
 
-void stab_live_size(cuda::GpuMat img, cuda::GpuMat& cur2, cuda::GpuMat& draw)
+void StablizeFrame(cuda::GpuMat img, cuda::GpuMat& cur2, cuda::GpuMat& draw)
 {
 
-	if (_first) {
+	if (bFirst) {
+		bFirst = false;
 
+		cuda::resize(img, prevImgCuda, Size(img.cols / RESIZE_FACTOR, img.rows / RESIZE_FACTOR));
+		cuda::cvtColor(prevImgCuda, prevGray, COLOR_BGR2GRAY);
+	
+	
+		Q.x = PROCESS_NOISE;			//시스템 노이즈
+		Q.y = PROCESS_NOISE;
+		Q.a = PROCESS_NOISE;
+		R.x = measurementNoise;			//측정 노이즈
+		R.y = measurementNoise;
+		R.a = measurementNoise;
 
-		if (bDummy)
-		{
-			prev_grey = img.clone();
+		if (img.cols == 1920) {
+			newLeft = 16;
+			newTop = 9;
+		}
+		else if (img.cols == 3840) {
+			newLeft = 16;
+			newTop = 9;
 		}
 		else {
-
-			cuda::resize(img, prevImgCuda, Size(img.cols / resize_factor, img.rows / resize_factor));
-			cuda::cvtColor(prevImgCuda, prev_grey, COLOR_BGR2GRAY);
-			cout << "grey size: " << prev_grey.size() << endl;
-			//cuda::cvtColor(prevImgCuda, prevImgCuda, COLOR_BGR2YUV);
-			//prev_grey = prevImgCuda[0];
-		//	cuda::cvtColor(prevImgCuda, prev_grey, yuv2gra);
+			cout << "[Exception] : image size is wrong" << endl;
+			return;
 		}
 
+		newWidth = img.rows - newLeft;
+		newHeight = img.cols - newTop;
 
 
-		_first = false;
-		double pstd = 4e-3;
-		double cstd = 0.25;
-		Q.x = pstd;			//시스템 노이즈
-		Q.y = pstd;
-		Q.a = pstd;
-		R.x = cstd;			//측정 노이즈
-		R.y = cstd;
-		R.a = cstd;
+		detector = cuda::createGoodFeaturesToTrackDetector(prevGray.type(), maxCorner, 0.01, minDistance);
+		pryLK_sparse = cuda::SparsePyrLKOpticalFlow::create(Size(winSize, winSize), 3, 10);
 
-		maxPixel_x = img.rows * border;
-		maxPixel_y = img.cols * border;
-
-		if (!bDummy) {
-
-			detector = cuda::createGoodFeaturesToTrackDetector(prev_grey.type(), maxCorner, 0.01, minDistance);
-			pryLK_sparse = cuda::SparsePyrLKOpticalFlow::create(Size(winSize, winSize), 3, 10);
-
-		}
 	}
 
 	else {
@@ -585,22 +560,15 @@ void stab_live_size(cuda::GpuMat img, cuda::GpuMat& cur2, cuda::GpuMat& draw)
 
 		start = clock();
 
-		if (bDummy) {
-			cur_grey = img.clone();
-		}
-		else {
+		cuda::resize(prevImgCuda, prevGray, Size(img.cols / RESIZE_FACTOR, img.rows / RESIZE_FACTOR));
+		cuda::resize(img, curGray, Size(img.cols / RESIZE_FACTOR, img.rows / RESIZE_FACTOR));
+		cuda::cvtColor(prevGray, prevGray, COLOR_BGR2GRAY);
+		cuda::cvtColor(curGray, curGray, COLOR_BGR2GRAY);
 
-			cuda::resize(prevImgCuda, prev_grey, Size(img.cols / resize_factor, img.rows / resize_factor));
-			cuda::resize(img, cur_grey, Size(img.cols / resize_factor, img.rows / resize_factor));
-			cuda::cvtColor(prev_grey, prev_grey, COLOR_BGR2GRAY);
-			cuda::cvtColor(cur_grey, cur_grey, COLOR_BGR2GRAY);
 
-		}
-
-		cuda::GpuMat prev_corner_gpu, cur_corner_gpu;
-		vector<Point2f> temp_corner;
-		vector<Point2f> prev_corner, cur_corner;
-		vector<Point2f> prev_corner2, cur_corner2;
+		cuda::GpuMat prevCornerGpu, curCornerGpu;
+		vector<Point2f> prevCorner, curCorner;
+		vector<Point2f> prevCorner2, curCorner2;
 		vector<KeyPoint> keypoints;
 
 		cuda::GpuMat gpuStatus;
@@ -608,17 +576,17 @@ void stab_live_size(cuda::GpuMat img, cuda::GpuMat& cur2, cuda::GpuMat& draw)
 		vector <uchar> status;
 		vector <float> err;
 
-		detector->detect(prev_grey, prev_corner_gpu);
-		pryLK_sparse->calc(prev_grey, cur_grey, prev_corner_gpu, cur_corner_gpu, gpuStatus, gpuErr);	//cold start issue
+		detector->detect(prevGray, prevCornerGpu);
+		pryLK_sparse->calc(prevGray, curGray, prevCornerGpu, curCornerGpu, gpuStatus, gpuErr);	//cold start issue
 	
 
-		if (prev_corner_gpu.empty() || cur_corner_gpu.empty() || gpuStatus.empty() || gpuErr.empty()) {
-			cout << "exception: corner point is empty." << endl;
+		if (prevCornerGpu.empty() || curCornerGpu.empty() || gpuStatus.empty() || gpuErr.empty()) {
+			cout << "[Exception] : corner point is empty." << endl;
 		}
 
 
-		prev_corner_gpu.download(prev_corner);
-		cur_corner_gpu.download(cur_corner);
+		prevCornerGpu.download(prevCorner);
+		curCornerGpu.download(curCorner);
 		gpuStatus.download(status);
 		gpuErr.download(err);
 		
@@ -626,35 +594,27 @@ void stab_live_size(cuda::GpuMat img, cuda::GpuMat& cur2, cuda::GpuMat& draw)
 
 	//	cout << "corner size : " << prev_corner.size() << endl;
 
-		for (size_t i = 0; i < prev_corner.size(); i++) {
+		for (size_t i = 0; i < prevCorner.size(); i++) {
 			if (status[i]) {
-				prev_corner2.push_back(prev_corner[i]);
-				cur_corner2.push_back(cur_corner[i]);
+				prevCorner2.push_back(prevCorner[i]);
+				curCorner2.push_back(curCorner[i]);
 			}
 		}
 
 		vector<uchar> inlier;
 	
-		T = estimateAffinePartial2D(prev_corner2, cur_corner2, inlier , RANSAC, th); //similar to rigidtransform
-		//T = estimateAffine2D(prev_corner2, cur_corner2, inlier, RANSAC, th);
-	//	T = findHomography(prev_corner2, cur_corner2, inlier, RANSAC, 0.5);
+		T = estimateAffinePartial2D(prevCorner2, curCorner2, inlier , RANSAC, THRESHOLD); //similar to rigidtransform
 	
 
 
-		T = T * resize_factor;  //corner size 1/2
+		T = T * RESIZE_FACTOR;  //corner size 1/2
 
-	
 		
 		if (T.data == NULL) {
 			last_T.copyTo(T);
 		}
-
 		T.copyTo(last_T);
 
-	//	Mat parseHomo(2, 3, CV_64F);
-	
-
-	//	ReclassifyInlier(prev_corner2, cur_corner2, status, inlier);
 
 
 		double dx = T.at<double>(0, 2);
@@ -683,55 +643,14 @@ void stab_live_size(cuda::GpuMat img, cuda::GpuMat& cur2, cuda::GpuMat& draw)
 			P = (Trajectory(1, 1, 1) - K) * P_;
 		}
 
-		// calculate difference in smoothed_trajectory and trajectory
 		double diff_x = (X.x - x);
 		double diff_y = (X.y - y);
 		double diff_a = (X.a - a);
-
-		//// calculate newer transformation array
-		//dx = dx + diff_x;
-		//dy = dy + diff_y;
-		//da = da + diff_a;
-
-
-		///*   T.at<double>(0, 0) = cos(da);
-		//   T.at<double>(0, 1) = -sin(da);
-		//   T.at<double>(1, 0) = sin(da);
-		//   T.at<double>(1, 1) = cos(da);*/
-
-		
-
-		//// T_cur.copyTo(T_);  
-
-		//T_.at<double>(0, 2) = diff_x;
-		//T_.at<double>(1, 2) = diff_y;
-
-		//T_.at<double>(0, 0) = 1;
-		//T_.at<double>(0, 1) = 0;
-		//T_.at<double>(1, 0) = 0;
-		//T_.at<double>(1, 1) = 1;
-
-	//	cout << cnt  << "      diff_x: " << diff_x <<  "   diff_y: " << diff_y << endl << endl;
-
-
 
 
 		Mat T_;
 		T.copyTo(T_);
 
-	/*	if (bMoveStabil) {
-			T_.at<double>(0, 2) = diff_x;
-			T_.at<double>(1, 2) = diff_y;
-			cout << cnt<< "		stabil move" << endl;
-	
-		}
-		else {
-			T_.at<double>(0, 2) = 0;
-			T_.at<double>(1, 2) = 0;
-
-		}*/
-
-		T_ = T_ / resize_factor;
 
 		T_.at<double>(0, 2) = diff_x;
 		T_.at<double>(1, 2) = diff_y;
@@ -746,10 +665,8 @@ void stab_live_size(cuda::GpuMat img, cuda::GpuMat& cur2, cuda::GpuMat& draw)
 		result = (double)(end - start);
 	//	cout << "calc time : " << result << endl;
 
-		//parseHomo = T_(cv::Rect(0, 0, 3, 2));
 
-
-		if (cur_corner2.size() < 10 || dx > 10 || dy > 10)
+		if (curCorner2.size() < 10 || dx > 10 || dy > 10)
 		{
 			cur2 = img;
 			cout << "			dx, dy is too big!			" << endl;
@@ -758,23 +675,19 @@ void stab_live_size(cuda::GpuMat img, cuda::GpuMat& cur2, cuda::GpuMat& draw)
 			cuda::warpAffine(img, cur2, T_, img.size());
 			//cuda::warpPerspective(img, cur2, T_, img.size());
 
-
-		cur2 = cur2(Range(maxPixel_x, cur2.rows - maxPixel_x), Range(maxPixel_y, cur2.cols - maxPixel_y));
+		
+		cur2 = cur2(Range(newLeft, newWidth), Range(newTop, newHeight));
 		cuda::resize(cur2, cur2, img.size());
 
 
-		newT = _T.clone();
 		prevImgCuda = img.clone();
-		cur_grey.copyTo(prev_grey);
-
-
-
+		curGray.copyTo(prevGray);
 
 
 		Mat gray;
 		prevImgCuda.download(gray);
-		resize(gray, gray, Size(img.cols / resize_factor, img.rows / resize_factor));
-		drawArrows_new(gray, prev_corner2, cur_corner2, status, inlier, Scalar(50, 200, 255));
+		resize(gray, gray, Size(img.cols / RESIZE_FACTOR, img.rows / RESIZE_FACTOR));
+		DrawArrows_new(gray, prevCorner2, curCorner2, status, inlier, Scalar(50, 200, 255));
 		draw.upload(gray);
 
 
@@ -791,7 +704,6 @@ void ReclassifyInlier(const vector< Point2f>& prevPts, const vector< Point2f>& n
 	int green = 0;
 	int yellow = 0;
 
-
 	for (size_t i = 0; i < nextPts.size(); ++i)
 	{
 		if (status[i])
@@ -804,27 +716,19 @@ void ReclassifyInlier(const vector< Point2f>& prevPts, const vector< Point2f>& n
 			double hypotenuse = sqrt((double)(p.y - q.y) * (p.y - q.y) + (double)(p.x - q.x) * (p.x - q.x));
 			double angle = atan2((double)p.y - q.y, (double)p.x - q.x);
 
-		
-
-			// Here we lengthen the arrow by a factor of three.
 			q.x = (int)(p.x - 3 * hypotenuse * cos(angle));
 			q.y = (int)(p.y - 3 * hypotenuse * sin(angle));
 
-			// Now we draw the main line of the arrow.
 			if (inlier[i] == 1)
 			{
-		
 				if (hypotenuse < 0.1) {
-
 					green++;
 					continue;
 				}
 				else {
-
 					p.x = (int)(q.x + 9 * cos(angle + CV_PI / 4));
 					p.y = (int)(q.y + 9 * sin(angle + CV_PI / 4));
-		
-
+	
 					p.x = (int)(q.x + 9 * cos(angle - CV_PI / 4));
 					p.y = (int)(q.y + 9 * sin(angle - CV_PI / 4));
 	
@@ -833,14 +737,11 @@ void ReclassifyInlier(const vector< Point2f>& prevPts, const vector< Point2f>& n
 			}
 			else
 			{
-
 				p.x = (int)(q.x + 9 * cos(angle + CV_PI / 4));
 				p.y = (int)(q.y + 9 * sin(angle + CV_PI / 4));
-		
-
+	
 				p.x = (int)(q.x + 9 * cos(angle - CV_PI / 4));
 				p.y = (int)(q.y + 9 * sin(angle - CV_PI / 4));
-		
 			}
 
 		}
@@ -887,8 +788,6 @@ static void drawArrows(Mat& frame, const vector< Point2f>& prevPts, const vector
 
 	for (size_t i = 0; i < nextPts.size(); ++i)
 	{
-		
-
 		if (status[i])
 		{
 			int line_thickness = 3;
@@ -906,18 +805,12 @@ static void drawArrows(Mat& frame, const vector< Point2f>& prevPts, const vector
 				continue;
 			}
 			
-
-			// Here we lengthen the arrow by a factor of three.
 			q.x = (int)(p.x - 3 * hypotenuse * cos(angle));
 			q.y = (int)(p.y - 3 * hypotenuse * sin(angle));
 
-			// Now we draw the main line of the arrow.
 			if (1)
 			{  
 				line(frame, p, q, line_color, line_thickness);
-
-				// Now draw the tips of the arrow. I do some scaling so that the
-				// tips look proportional to the main line of the arrow.
 
 				p.x = (int)(q.x + 9 * cos(angle + CV_PI / 4));
 				p.y = (int)(q.y + 9 * sin(angle + CV_PI / 4));
@@ -931,9 +824,6 @@ static void drawArrows(Mat& frame, const vector< Point2f>& prevPts, const vector
 			else
 			{
 				line(frame, p, q, Scalar(20, 20, 200), line_thickness - 1);
-
-				// Now draw the tips of the arrow. I do some scaling so that the
-				// tips look proportional to the main line of the arrow.
 
 				p.x = (int)(q.x + 9 * cos(angle + CV_PI / 4));
 				p.y = (int)(q.y + 9 * sin(angle + CV_PI / 4));
@@ -951,18 +841,13 @@ static void drawArrows(Mat& frame, const vector< Point2f>& prevPts, const vector
 
 
 
-
-
-static void drawArrows_new(Mat& frame, const vector< Point2f>& prevPts, const vector< Point2f>& nextPts, const vector< uchar>& status, const vector<uchar>& inlier, Scalar line_color)
+static void DrawArrows_new(Mat& frame, const vector< Point2f>& prevPts, const vector< Point2f>& nextPts, const vector< uchar>& status, const vector<uchar>& inlier, Scalar line_color)
 {
 	int green = 0;
 	int yellow = 0;
 
-
 	for (size_t i = 0; i < nextPts.size(); ++i)
 	{
-
-
 		if (status[i])
 		{
 			int line_thickness = 3;
@@ -971,17 +856,12 @@ static void drawArrows_new(Mat& frame, const vector< Point2f>& prevPts, const ve
 			Point q = nextPts[i];
 
 			double angle = atan2((double)p.y - q.y, (double)p.x - q.x);
-
 			double hypotenuse = sqrt((double)(p.y - q.y) * (p.y - q.y) + (double)(p.x - q.x) * (p.x - q.x));
 
-		
 
-
-			// Here we lengthen the arrow by a factor of three.
 			q.x = (int)(p.x - 3 * hypotenuse * cos(angle));
 			q.y = (int)(p.y - 3 * hypotenuse * sin(angle));
 
-			// Now we draw the main line of the arrow.
 			if (inlier[i] == 1)
 			{
 				if (hypotenuse < 1.0) {
@@ -992,9 +872,6 @@ static void drawArrows_new(Mat& frame, const vector< Point2f>& prevPts, const ve
 
 				else {
 					line(frame, p, q, line_color, line_thickness);
-
-					// Now draw the tips of the arrow. I do some scaling so that the
-					// tips look proportional to the main line of the arrow.
 
 					p.x = (int)(q.x + 9 * cos(angle + CV_PI / 4));
 					p.y = (int)(q.y + 9 * sin(angle + CV_PI / 4));
@@ -1010,9 +887,6 @@ static void drawArrows_new(Mat& frame, const vector< Point2f>& prevPts, const ve
 			{
 				line(frame, p, q, Scalar(20, 20, 200), line_thickness - 1);
 
-				// Now draw the tips of the arrow. I do some scaling so that the
-				// tips look proportional to the main line of the arrow.
-
 				p.x = (int)(q.x + 9 * cos(angle + CV_PI / 4));
 				p.y = (int)(q.y + 9 * sin(angle + CV_PI / 4));
 				line(frame, p, q, Scalar(20, 20, 200), line_thickness - 1);
@@ -1021,7 +895,6 @@ static void drawArrows_new(Mat& frame, const vector< Point2f>& prevPts, const ve
 				p.y = (int)(q.y + 9 * sin(angle - CV_PI / 4));
 				line(frame, p, q, Scalar(20, 20, 200), line_thickness - 1);
 			}
-
 		}
 	}
 	
@@ -1029,7 +902,5 @@ static void drawArrows_new(Mat& frame, const vector< Point2f>& prevPts, const ve
 	double yellow_per = ((double)yellow / nextPts.size()) * 100;
 
 	//cout << "nextPts size: " << nextPts.size() << " green  : " << green << "		yellow  : " << yellow << "	yellow / green  " << (double)yellow / green << endl;
-
 	//cout << "nextPts size: " << nextPts.size() <<" green percent : " << green_per<< "		yellow percent : " << yellow_per  <<"	Total score: " << abs(green_per-yellow_per)/100.0<< endl;
-	//cout << "nextPts size: " << nextPts.size() << "	  yellow : " << yellow << "		green : " << green << "		 //		green percent : " << ((double)green / nextPts.size()) * 100 << "		yellow percent : " << ((double)yellow / nextPts.size()) * 100 << endl;
 }
